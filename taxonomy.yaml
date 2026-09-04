@@ -1364,7 +1364,7 @@ surfaces:
         docs:
           - docs/cli/plugins.md
           - docs/plugins/compatibility.md
-          - docs/clawhub/publishing.md
+          - docs/plugins/community.md
         search_anchors:
           - publishing plugins
           - clawhub publishing
@@ -4736,8 +4736,6 @@ surfaces:
             coverageIds: [clawhub.skill-publishing-flow]
             description: Owner-scoped ClawHub skill publishing, validation, release, and review.
         docs:
-          - docs/clawhub/publishing.md
-          - docs/clawhub/skill-format.md
           - docs/tools/creating-skills.md
           - docs/plugins/community.md
         search_anchors:
@@ -4823,8 +4821,7 @@ surfaces:
           - docs/cli/plugins.md
           - docs/plugins/compatibility.md
           - docs/plugins/plugin-inventory.md
-          - docs/clawhub/publishing.md
-          - docs/clawhub/security-audits.md
+          - docs/plugins/community.md
           - docs/tools/skills.md
           - docs/tools/skills-config.md
         search_anchors:
