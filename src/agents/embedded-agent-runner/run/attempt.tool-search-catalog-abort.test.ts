@@ -200,6 +200,8 @@ describe("runEmbeddedAttempt tool-search catalog cleanup", () => {
       if (code) {
         expect(outcomes[0]?.result).toMatchObject({
           details: {
+            status: "failed",
+            bridgeDispatchStarted: mode !== "joined Code Mode",
             error: expect.stringContaining(
               mode === "joined Code Mode" ? "agents is not defined" : TOOL_EXECUTION_GATED_MESSAGE,
             ),
