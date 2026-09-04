@@ -98,7 +98,7 @@ private final class CronGatewayFixture: @unchecked Sendable {
                 default:
                     payload = #"{"ok":true}"#
                 }
-                socket.emitReceiveSuccess(.data(Data(
+                socket.enqueueReceiveSuccess(.data(Data(
                     #"{"type":"res","id":"\#(request.id)","ok":true,"payload":\#(payload)}"#.utf8)))
             })
         })
@@ -165,21 +165,21 @@ private final class CronGatewayFixture: @unchecked Sendable {
         let response = #"{"type":"res","id":"\#(request.id)","ok":true,"payload":{"entries":["# +
             #"{"ts":1700000000000,"jobId":"\#(jobId)","action":"finished","# +
             #""status":"ok","summary":"\#(summary)"}]}}"#
-        socket.emitReceiveSuccessOnce(.data(Data(response.utf8)))
+        socket.enqueueReceiveSuccess(.data(Data(response.utf8)))
     }
 
     func fail(_ request: CronGatewayRequest, message: String) async throws {
         let socket = try await self.readySocket()
         let response = #"{"type":"res","id":"\#(request.id)","ok":false,"# +
             #""error":{"code":"INVALID_REQUEST","message":"\#(message)"}}"#
-        socket.emitReceiveSuccessOnce(.data(Data(response.utf8)))
+        socket.enqueueReceiveSuccess(.data(Data(response.utf8)))
     }
 
     func respondWithJobs(to request: CronGatewayRequest) async throws {
         let socket = try await self.readySocket()
         let payload = await self.requests.jobsResponse()
         let response = #"{"type":"res","id":"\#(request.id)","ok":true,"payload":\#(payload)}"#
-        socket.emitReceiveSuccessOnce(.data(Data(response.utf8)))
+        socket.enqueueReceiveSuccess(.data(Data(response.utf8)))
     }
 
     func sendFinishedEvent(jobId: String) async throws {
@@ -187,7 +187,7 @@ private final class CronGatewayFixture: @unchecked Sendable {
         let sequence = await self.requests.eventSequence()
         let event = #"{"type":"event","event":"cron","seq":\#(sequence),"# +
             #""payload":{"jobId":"\#(jobId)","action":"finished"}}"#
-        socket.emitReceiveSuccessOnce(.data(Data(event.utf8)))
+        socket.enqueueReceiveSuccess(.data(Data(event.utf8)))
     }
 
     private func readySocket() async throws -> GatewayTestWebSocketTask {
@@ -205,6 +205,28 @@ private final class CronGatewayFixture: @unchecked Sendable {
 @Suite(.serialized)
 @MainActor
 struct CronJobsStoreTests {
+    @Test func `ordinary fixture replies retain FIFO order between receives`() {
+        let socket = GatewayTestWebSocketTask()
+        let received = LockIsolated<[String]>([])
+        let record: @Sendable (Result<URLSessionWebSocketTask.Message, Error>) -> Void = { result in
+            guard case let .success(.string(message)) = result else {
+                Issue.record("Expected a synthetic string frame")
+                return
+            }
+            received.withValue { $0.append(message) }
+        }
+        socket.receive(completionHandler: record)
+        socket.enqueueReceiveSuccess(.string("history"))
+        socket.enqueueReceiveSuccess(.string("jobs"))
+        socket.enqueueReceiveSuccess(.string("status"))
+        #expect(received.value == ["history"])
+
+        socket.receive(completionHandler: record)
+        socket.receive(completionHandler: record)
+
+        #expect(received.value == ["history", "jobs", "status"])
+    }
+
     @Test(arguments: [false, true])
     func `stopping the pane rejects a late job list completion`(succeeds: Bool) async throws {
         let (arrivals, signal) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
