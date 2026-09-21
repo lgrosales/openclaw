@@ -1,70 +1,87 @@
-import assert from "node:assert/strict";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import { runCommandWithTimeout } from "../process/exec.js";
+import { withEnvAsync } from "../test-utils/env.js";
 import {
-  UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV,
-  writeUpdatePostInstallDoctorResult,
-  type UpdatePostInstallDoctorResult,
-} from "./update-doctor-result.js";
-import { runGitDoctorStep } from "./update-runner-git-steps.js";
-import type { UpdateStepResult } from "./update-runner-types.js";
+  buildUpdateDoctorEnv,
+  resolveUpdateDoctorExecutionPolicy,
+} from "./update-runner-doctor.js";
 
-describe("direct Git Doctor receipts", () => {
-  it.each([undefined, "include-ownership", "requester-revoked"])(
-    "retains writer evidence and refusal %s without a CLI callback",
-    async (reason) => {
-      const result: UpdatePostInstallDoctorResult = {
-        status: reason ? "error" : "ok",
-        configChanges: [{ kind: "key", key: "agents" }],
-        ...(reason
-          ? { configWriteRefusal: { reason, message: "Config writer refused.", keys: ["agents"] } }
-          : {}),
-      };
-      const steps: UpdateStepResult[] = [];
-      const onStepComplete = vi.fn();
-      const step = await runGitDoctorStep({
-        root: "/synthetic/checkout",
-        entryPath: "/synthetic/checkout/openclaw.mjs",
-        nodePath: "/synthetic/node",
-        fix: true,
-        env: {},
-        step: (name, argv, cwd, env) => ({
-          name,
-          argv,
-          cwd,
-          env,
-          timeoutMs: 1000,
-          stepIndex: 0,
-          totalSteps: 1,
-          results: steps,
-          progress: { onStepComplete },
-          runCommand: async (_argv, options) => {
-            const resultPath = options.env?.[UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV];
-            if (!resultPath) {
-              throw new Error("Missing Doctor result path");
-            }
-            await writeUpdatePostInstallDoctorResult({ resultPath, result });
-            return { code: 0, stdout: "", stderr: "" };
+describe("resolveUpdateDoctorExecutionPolicy", () => {
+  it("keeps fix mode when service repair is authorized", () => {
+    expect(
+      resolveUpdateDoctorExecutionPolicy({
+        targetVersion: "2026.4.1",
+        allowGatewayServiceRepair: true,
+      }),
+    ).toEqual({ fix: true });
+  });
+
+  it("uses the external policy for targets that support it", () => {
+    for (const targetVersion of ["2026.4.25-beta.1", "2026.4.25-beta.11", "2026.4.25"]) {
+      expect(
+        resolveUpdateDoctorExecutionPolicy({
+          targetVersion,
+          allowGatewayServiceRepair: false,
+        }),
+      ).toEqual({ fix: true, serviceRepairPolicy: "external" });
+    }
+  });
+
+  it("does not run fix mode on older targets that cannot honor ownership", () => {
+    expect(
+      resolveUpdateDoctorExecutionPolicy({
+        targetVersion: "2026.4.24",
+        allowGatewayServiceRepair: false,
+      }),
+    ).toEqual({ fix: false });
+  });
+
+  it.each([
+    {
+      name: "authorized service repair",
+      targetVersion: "2026.4.1",
+      allowGatewayServiceRepair: true,
+      expectedPolicy: null,
+    },
+    {
+      name: "an older target without service repair",
+      targetVersion: "2026.4.24",
+      allowGatewayServiceRepair: false,
+      expectedPolicy: null,
+    },
+    {
+      name: "a supported target without service repair",
+      targetVersion: "2026.4.25",
+      allowGatewayServiceRepair: false,
+      expectedPolicy: "external",
+    },
+  ])(
+    "passes the selected Doctor policy to a real child for $name",
+    async ({ targetVersion, allowGatewayServiceRepair, expectedPolicy }) => {
+      const policy = resolveUpdateDoctorExecutionPolicy({
+        targetVersion,
+        allowGatewayServiceRepair,
+      });
+      const result = await withEnvAsync({ OPENCLAW_SERVICE_REPAIR_POLICY: "external" }, () =>
+        runCommandWithTimeout(
+          [
+            process.execPath,
+            "-e",
+            "process.stdout.write(JSON.stringify(process.env.OPENCLAW_SERVICE_REPAIR_POLICY ?? null))",
+          ],
+          {
+            timeoutMs: 5000,
+            env: buildUpdateDoctorEnv({
+              allowGatewayServiceRepair,
+              allowGatewayActivation: false,
+              serviceRepairPolicy: policy.serviceRepairPolicy,
+            }),
           },
-        }),
-      });
-
-      expect(step).toMatchObject({
-        exitCode: reason ? 1 : 0,
-        configChanges: result.configChanges,
-      });
-      assert(step);
-      expect(step.configWriteRefusal).toEqual(result.configWriteRefusal);
-      expect(steps).toEqual([step]);
-      expect(onStepComplete).toHaveBeenCalledExactlyOnceWith(
-        expect.objectContaining({
-          configChanges: result.configChanges,
-          ...(reason ? { configWriteRefusal: result.configWriteRefusal } : {}),
-        }),
+        ),
       );
-      if (reason) {
-        expect(step.stderrTail).toContain(`agents. ${reason}: Config writer refused.`);
-        expect(step.advisory).toBeUndefined();
-      }
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe(JSON.stringify(expectedPolicy));
     },
   );
 });

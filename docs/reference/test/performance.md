@@ -27,6 +27,35 @@ pnpm test:perf:profile:runner -- --output-dir .artifacts/profiles -- --config te
 
 Native imports also need the plugin's declared dependencies and a resolvable `openclaw` host package. The profiler does not install or link dependencies: missing dependencies remain import failures in the JSON report and cause a nonzero exit.
 
+### Zod schema compilation
+
+Compile individual schemas only after measuring a repeated validation path.
+Use the pinned Zod package's `z.compile(schema)` API and retain the compiled
+schema at its existing owner. The `zod/compile` side-effect import enables a
+process-wide hook and is unsuitable for a selective optimization.
+
+Nested tool activity validation compiles its schema on the first matching read
+or creation and reuses it across Gateway turns. Ordinary transcript rows bypass
+that compilation. Config, transcript entry, and browser relay schemas retain
+their existing parsers because their measured caller costs did not justify
+compilation.
+
+Measure compilation and the first operation separately from warmed operations.
+Compare valid, invalid, and mixed inputs through the actual caller, including
+any JSON decoding, copying, or context construction it performs. For predicates
+that discard parsed output, compare ordinary `safeParse(...).success`,
+`z.validate(schema, input)`, and validation with a compiled schema; avoiding
+error allocation can help independently of compilation.
+
+Keep schemas shared with the strict-CSP Control UI uncompiled: explicit
+compilation attempts code generation even when `jitless` is set. Reusing a
+stable schema across calls is a separate optimization that needs no compiler.
+
+Keep refinement and transform callbacks pure: an invalid compiled parse can
+fall back to the runtime parser and execute those callbacks twice. Default
+compilation preserves runtime fallback for unsupported schemas; async parsing
+and encoding keep their existing runtime behavior.
+
 ## Benchmarks
 
 <Accordion title="Session history (scripts/bench-session-history.ts)">
@@ -152,22 +181,90 @@ paired-node wire tests provide the full Gateway dispatch and reconciliation proo
 Runs synthetic streaming agent turns in parallel sessions on one isolated
 Gateway. Add tool calls, session history, observers, and control-plane probes to
 reproduce allocation pressure from a busy Gateway. Build with `pnpm build`
-first; no provider key is required.
+first. The default mock provider needs no key. Dreaming is disabled in this
+isolated benchmark; ordinary indexing, recaps, and database idle retention keep
+their normal settings.
 
 ```bash
 pnpm test:gateway:concurrency -- --concurrency 16 --tool-events --workspace-fanout --session-count 100 --history-messages 20 --history-clients 4 --subscribers 4 --visible-observer --control-plane --heap-prof-dir .artifacts/gateway-heap --output .artifacts/gateway-concurrency.json
 pnpm test:gateway:concurrency -- --concurrency 64 --turns-per-session 8 --tool-events --timeout-ms 600000 --heap-prof-dir .artifacts/gateway-sustained-heap --output .artifacts/gateway-sustained.json
 ```
 
+Use `--provider openai` with `OPENAI_API_KEY` supplied in the environment for
+real OpenAI turns:
+
+```bash
+pnpm test:gateway:concurrency -- --provider openai --runs 1 --warmup 0 \
+  --agent-warmup-turns 0 --agent-count 32 --concurrency 32 --turns-per-session 3 \
+  --session-count 1000 --history-messages 20 --history-message-chars 1024 \
+  --probe-rounds 64 --cadence-ms 100 --session-updates 100 \
+  --session-update-clients 2 --history-clients 2 --history-burst 2 \
+  --subscribers 4 --control-plane --timeout-ms 120000 \
+  --load-cpu-prof-dir .artifacts/gateway-live-cpu \
+  --output .artifacts/gateway-live.json
+```
+
+Live mode uses a fixed OpenAI model, denies tools, and limits output to 128
+tokens. It permits one run with no warmups and at most 96 turns, and checks
+streamed replies, terminal receipts, history, and persisted replies after
+shutdown. It does not report synthetic provider request counts. CPU profiles
+are instrumented observations; keep them separate from unprofiled latency
+measurements. The [manual workflow](/ci/scheduled-workflows#gateway-concurrency-benchmark)
+runs this workload with repository-managed credentials.
+
 `--concurrency` controls parallel sessions; `--turns-per-session` controls serial
 turns in each session (default 1, maximum 100). The second example completes 512
 turns across 64 sessions. Each session starts its next turn as soon as its
 previous turn completes, retaining its conversation history and workspace;
 there is no barrier between rounds. The fresh-connection probe runs once after
-every session has started its first turn. `--tool-events` requests a tool call
-on every turn, including follow-ups. The per-run timeout still bounds the whole
-workload. Health/control sampling is capped at 2,048 samples, while heap
+every session has started its first turn. `--tool-events` requires a matching
+successful `exec` result and the expected visible final reply on every turn,
+including follow-ups. Missing or duplicate tool evidence fails the run. The load
+timeout bounds turns and probes; startup, setup, and probe warmup have separate
+budgets. Health/control sampling is capped at 2,048 samples, while heap
 sampling continues until the full workload finishes.
+
+The fixture gives the utility model its own structured mock response, preserving
+the agent model's automatic tool loop. `turnEvidence.observerModelDigestTurns`
+counts turns with a published model-derived observer digest. A short run can
+legitimately report zero; observer correctness proof requires a positive count.
+
+`mockRequests` retains six mock-server counter checkpoints and their parent
+monotonic request bounds. Ingress deltas cover `startupAndWarmup` (readiness,
+connect, visibility, and probe warmup), `setup`, `agentWarmup` (optional agent
+turns on the same Gateway), `loadBracket`, and `postLoad` (through Gateway
+shutdown). The `agentWarmup` bracket remains present when `--agent-warmup-turns`
+is zero (the default); warmup turns are excluded from measured load. These
+deltas distinguish Responses, Chat Completions, embeddings, and other routes,
+including rejected request bodies; health and
+model-catalog reads are excluded. These HTTP brackets are not exact CPU capture
+windows or causal attribution. `selections` through the final checkpoint separately
+count model/global controlled responses and automatic tool/text branches, not completed
+responses. Auxiliary model requests remain included; neither total is a count
+of agent turns. Missing, regressing, or replaced-server checkpoints fail instead
+of becoming zero. Reports retain counters, not raw prompts or request bodies.
+
+`--agent-count N` distributes the same session inventory round-robin across
+1–128 configured agents. It defaults to one agent and cannot exceed the larger
+of `--session-count` and `--concurrency`. Increasing it does not add sessions or
+turns. Multi-agent runs use `main`, `bench-agent-2`, and subsequent IDs with
+separate workspaces. `--workspace-fanout` still assigns a distinct workspace per
+session. Separate browser click targets remain on `main`.
+
+For example, `--agent-count 32 --session-count 1000 --concurrency 32
+--turns-per-session 3` seeds 1,000 sessions and completes 96 turns, three per
+agent. Before the load window and its CPU/allocation profiling, multi-agent runs
+require each agent's current published configured model through `models.list`,
+then verify its complete seeded inventory and reported per-agent SQLite path
+through all pages of scoped `sessions.list` reads. This checks the Gateway's
+reported storage route; it does not independently inspect database files.
+`agentCoverage.beforeLoad` retains the model response and every session page.
+`activeTurnAgentIds` and
+`completedTurns` distinguish the agents handling turns from the configured
+roster: 128 configured agents with 16 parallel sessions does not mean 128 agents
+handled turns. Multi-agent history probe rows retain `sessionKey`, which maps
+successful requests to the independently verified store inventory. These extra
+setup reads do not run in the default one-agent case.
 
 Use `--probe-rounds N` for allocation comparisons with equal probe work. It
 attempts exactly N sampler rounds and N history bursts per configured history
@@ -347,7 +444,7 @@ listener. It does not attach to or modify an existing operator Gateway.
 
 <Accordion title="Gateway restart (scripts/bench-gateway-restart.ts)">
 
-macOS and Linux only (uses SIGUSR1 for in-process restarts; fails immediately on Windows). Same built-entry default and `--entry scripts/run-node.mjs` override as gateway startup above.
+macOS and Linux only (uses SIGUSR2 for in-process restarts; fails immediately on Windows). Same built-entry default and `--entry scripts/run-node.mjs` override as gateway startup above.
 
 ```bash
 pnpm test:restart:gateway -- --case skipChannels --runs 1 --restarts 5
