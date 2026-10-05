@@ -1,4 +1,7 @@
-import type { BoundDeviceBootstrapContext } from "./device-bootstrap.worker-types.js";
+import type {
+  BoundDeviceBootstrapContext,
+  DeviceBootstrapBoundContextInput,
+} from "./device-bootstrap.worker-types.js";
 import type { DevicePairingPendingRequest, PairedDevice } from "./device-pairing.types.js";
 
 export type DevicePairingReadCommand =
@@ -7,7 +10,7 @@ export type DevicePairingReadCommand =
   | { type: "devicePairing.pending"; requestId: string; nowMs: number }
   | {
       type: "devicePairing.bootstrapContext";
-      input: { token: string; deviceId: string; publicKey: string; nowMs: number };
+      input: DeviceBootstrapBoundContextInput;
     };
 
 export type DevicePairingBinding = { identity: string; generation?: string };
@@ -27,10 +30,17 @@ export type DevicePairingReadReply = {
   | { type: "devicePairing.bootstrapContext"; context: BoundDeviceBootstrapContext | null }
 );
 
+export type CloudWorkerSetupCompletionPublication = {
+  environmentId: string;
+  nodeDeviceId: string;
+  updatedAtMs: number;
+};
+
 export type DevicePairingCommitReceipt = {
   kind: "devicePairing";
   beforeRevision: string;
   revision: string;
   changed: DevicePairingBindingFact[];
   tokensReplaced?: { deviceId: string; roles: string[] };
+  workerEnvironment?: CloudWorkerSetupCompletionPublication;
 };

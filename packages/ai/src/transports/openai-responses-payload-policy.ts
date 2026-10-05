@@ -29,14 +29,6 @@ type OpenAIResponsesPayloadPolicyOptions = {
   enableServerCompaction?: boolean;
 };
 
-type OpenAIResponsesEndpointClass =
-  | "default"
-  | "openai-public"
-  | "openai"
-  | "azure-openai"
-  | "xai-native"
-  | "custom";
-
 type OpenAIResponsesPayloadPolicy = {
   allowsSafetyIdentifier: boolean;
   allowsServiceTier: boolean;
@@ -52,35 +44,16 @@ type OpenAIResponsesPayloadPolicy = {
   usesInstructionsField: boolean;
 };
 
-type OpenAIResponsesPayloadCapabilities = {
-  allowsOpenAISafetyIdentifier: boolean;
-  allowsOpenAIServiceTier: boolean;
-  allowsResponsesStore: boolean;
-  explicitContinuationOptIn: boolean;
-  shouldStripResponsesPromptCache: boolean;
-  supportsResponsesStoreField: boolean;
-  usesKnownNativeOpenAIRoute: boolean;
-  usesVerifiedInstructionsEndpoint: boolean;
-};
-
 const OPENAI_RESPONSES_PROVIDERS = new Set(["openai", "azure-openai", "azure-openai-responses"]);
 function resolveUrlHostname(value: unknown): string | undefined {
   const trimmed = readStringValue(value)?.trim();
   if (!trimmed) {
     return undefined;
   }
-  try {
-    return new URL(trimmed).hostname.toLowerCase();
-  } catch {
-    try {
-      return new URL(`https://${trimmed}`).hostname.toLowerCase();
-    } catch {
-      return undefined;
-    }
-  }
+  return (URL.parse(trimmed) ?? URL.parse(`https://${trimmed}`))?.hostname.toLowerCase();
 }
 
-function resolveOpenAIResponsesEndpointClass(baseUrl: unknown): OpenAIResponsesEndpointClass {
+function resolveOpenAIResponsesEndpointClass(baseUrl: unknown) {
   const trimmed = readStringValue(baseUrl)?.trim();
   if (!trimmed) {
     return "default";
@@ -129,9 +102,7 @@ function readCompatPayloadBoolean(
   return typeof value === "boolean" ? value : undefined;
 }
 
-function resolveOpenAIResponsesPayloadCapabilities(
-  model: OpenAIResponsesPayloadModel,
-): OpenAIResponsesPayloadCapabilities {
+function resolveOpenAIResponsesPayloadCapabilities(model: OpenAIResponsesPayloadModel) {
   const provider = normalizeOptionalLowercaseString(model.provider);
   const api = normalizeOptionalLowercaseString(model.api);
   const isOpenAIProvider = provider === "openai";
@@ -185,13 +156,10 @@ function resolveOpenAIResponsesPayloadCapabilities(
       endpointClass === "openai-public",
     allowsOpenAIServiceTier:
       (provider === "openai" &&
-        (api === "openai-responses" || api === "openclaw-openai-responses-transport") &&
-        endpointClass === "openai-public") ||
+        (api === "openai-responses" || api === "openclaw-openai-responses-transport")) ||
       (isOpenAIProvider &&
         (api === "openai-chatgpt-responses" ||
-          api === "openclaw-openai-chatgpt-responses-transport" ||
-          api === "openai-responses" ||
-          api === "openclaw-openai-responses-transport") &&
+          api === "openclaw-openai-chatgpt-responses-transport") &&
         endpointClass === "openai"),
     allowsResponsesStore:
       supportsResponsesStoreField &&

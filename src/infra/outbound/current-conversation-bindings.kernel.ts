@@ -5,10 +5,12 @@ import {
 } from "@openclaw/normalization-core/number-coercion";
 import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
 import {
+  createSqliteQueryCache,
   getNodeSqliteKysely,
   prepareSqliteQuerySync,
   prepareSqliteQueryTakeFirstSync,
 } from "../kysely-sync.js";
+import { runSqliteDeferredTransactionSync } from "../sqlite-transaction.js";
 import { currentConversationBindingRow } from "./current-conversation-binding-row.js";
 import { normalizeConversationRef } from "./session-binding-normalization.js";
 import type { ConversationRef, SessionBindingRecord } from "./session-binding.types.js";
@@ -22,12 +24,10 @@ type CurrentConversationBindingDatabase = Pick<
 >;
 
 export type CurrentConversationBindingScope = { channel: string; accountId: string };
-type CurrentConversationBindingRow = {
-  binding_key: string;
-  binding_id: string;
-  target_session_key: string;
-  record_json: string;
-};
+type CurrentConversationBindingRow = Pick<
+  CurrentConversationBindingDatabase["current_conversation_bindings"],
+  "binding_key" | "binding_id" | "target_session_key" | "record_json"
+>;
 
 function createCurrentConversationBindingQueries(db: DatabaseSync) {
   const bindingDb = getNodeSqliteKysely<CurrentConversationBindingDatabase>(db);
@@ -141,19 +141,9 @@ function createCurrentConversationBindingQueries(db: DatabaseSync) {
 }
 
 // Cache SQL templates per handle; native statements and their invalidation remain executor-owned.
-const currentConversationBindingQueries = new WeakMap<
-  DatabaseSync,
-  ReturnType<typeof createCurrentConversationBindingQueries>
->();
-
-function getCurrentConversationBindingQueries(db: DatabaseSync) {
-  let queries = currentConversationBindingQueries.get(db);
-  if (!queries) {
-    queries = createCurrentConversationBindingQueries(db);
-    currentConversationBindingQueries.set(db, queries);
-  }
-  return queries;
-}
+const getCurrentConversationBindingQueries = createSqliteQueryCache(
+  createCurrentConversationBindingQueries,
+);
 
 function buildConversationKey(ref: ConversationRef): string {
   return [ref.channel, ref.accountId, ref.parentConversationId ?? "", ref.conversationId].join(
@@ -266,6 +256,7 @@ export function updateCurrentConversationBindingRecordInDatabase(
 export function inspectCurrentConversationBindingRecordInDatabase(
   db: DatabaseSync,
   conversation: ConversationRef,
+  now = Date.now(),
 ): SessionBindingRecord | null {
   const row = readCurrentConversationBindingRow(
     db,
@@ -273,7 +264,20 @@ export function inspectCurrentConversationBindingRecordInDatabase(
     buildConversationKey(conversation),
   );
   const record = row ? bindingRowsToRecords([row])[0] : undefined;
-  return record && !isBindingExpired(record) ? record : null;
+  return record && !isBindingExpired(record, now) ? record : null;
+}
+
+/** Higher-priority absences and later fallback rows must come from the same snapshot. */
+export function readCurrentConversationBindingSelectionInDatabase(
+  db: DatabaseSync,
+  conversations: readonly ConversationRef[],
+): Array<SessionBindingRecord | null> {
+  return runSqliteDeferredTransactionSync(db, () => {
+    const now = Date.now();
+    return conversations.map((conversation) =>
+      inspectCurrentConversationBindingRecordInDatabase(db, conversation, now),
+    );
+  });
 }
 
 export function readCurrentConversationBindingResolutionInDatabase(
@@ -315,4 +319,35 @@ export function listCurrentConversationBindingRowsBySession(
     return list.byScope({ targetSessionKey, scope: normalized }).rows;
   }
   return list.bySession(targetSessionKey).rows;
+}
+
+/** Warm listings avoid writer admission unless an expired record requires the existing repair. */
+export function readCurrentConversationBindingListInDatabase(
+  db: DatabaseSync,
+  targetSessionKey: string,
+  scope?: CurrentConversationBindingScope,
+): { records: SessionBindingRecord[]; requiresPrune: boolean } {
+  const records = bindingRowsToRecords(
+    listCurrentConversationBindingRowsBySession(db, targetSessionKey, scope),
+  );
+  return { records, requiresPrune: records.some((record) => isBindingExpired(record)) };
+}
+
+/** Reread after writer admission; malformed rows keep the same expiry-triggered repair contract. */
+export function pruneCurrentConversationBindingListInTransaction(
+  db: DatabaseSync,
+  targetSessionKey: string,
+  scope?: CurrentConversationBindingScope,
+): SessionBindingRecord[] {
+  const rows = listCurrentConversationBindingRowsBySession(db, targetSessionKey, scope);
+  const active: SessionBindingRecord[] = [];
+  for (const row of rows) {
+    const record = bindingRowsToRecords([row])[0];
+    if (!record || isBindingExpired(record)) {
+      deleteCurrentConversationBindingRow(db, row.binding_key);
+    } else {
+      active.push(record);
+    }
+  }
+  return active;
 }

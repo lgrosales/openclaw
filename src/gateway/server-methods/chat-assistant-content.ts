@@ -1,6 +1,7 @@
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   getReplyPayloadMetadata,
+  isReplyPayloadStatusNotice,
   readPairingQrReplyChannelData,
   stripReplyMediaFailureFallback,
   type ReplyPayload,
@@ -11,7 +12,6 @@ import { renderQrPngDataUrl } from "../../media/qr-image.js";
 import { renderQrTerminal } from "../../media/qr-terminal.js";
 import { trimTextPreservingCode } from "../../shared/text/text-projection.js";
 import { stripInlineDirectiveTagsForDelivery } from "../../utils/directive-tags.js";
-import { stripEnvelopeFromMessage } from "../chat-sanitize.js";
 import { isSuppressedControlReplyText } from "../control-reply-text.js";
 import {
   buildManagedMediaFailureBlock,
@@ -95,15 +95,9 @@ export function sanitizeAssistantDisplayText(
   if (!value) {
     return undefined;
   }
-  const withoutEnvelope = stripEnvelopeFromMessage(value);
-  const normalized = typeof withoutEnvelope === "string" ? withoutEnvelope : value;
-  const stripped = stripInlineDirectiveTagsForDelivery(normalized);
+  const stripped = stripInlineDirectiveTagsForDelivery(value);
   const visible = trimTextPreservingCode(stripped.text);
-  return visible
-    ? options?.preserveBoundaries && !stripped.changed
-      ? normalized
-      : visible
-    : undefined;
+  return visible ? (options?.preserveBoundaries && !stripped.changed ? value : visible) : undefined;
 }
 
 export function prepareAssistantDisplayText(
@@ -113,12 +107,10 @@ export function prepareAssistantDisplayText(
   if (!value) {
     return undefined;
   }
-  const withoutEnvelope = stripEnvelopeFromMessage(value);
-  const normalized = typeof withoutEnvelope === "string" ? withoutEnvelope : value;
-  return normalized.trim()
+  return value.trim()
     ? options?.preserveBoundaries
-      ? normalized
-      : trimTextPreservingCode(normalized)
+      ? value
+      : trimTextPreservingCode(value)
     : undefined;
 }
 
@@ -212,18 +204,23 @@ export async function buildAssistantReplyContentFromInputs(
   for (const entry of plan) {
     const payload = entry.payload;
     const metadataSource = payloads[entry.sourceIndex] ?? payload;
-    const mediaFailures = getReplyPayloadMetadata(metadataSource)?.assistantMediaFailures ?? [];
+    const mediaFailures = getReplyPayloadMetadata(payload)?.assistantMediaFailures ?? [];
     const isPrepared = params.inputs[entry.sourceIndex]?.kind === "prepared";
+    const statusNotice = isReplyPayloadStatusNotice(payload);
     const displayText = isPrepared ? prepareAssistantDisplayText : sanitizeAssistantDisplayText;
     const text = displayText(stripReplyMediaFailureFallback(payload.text, mediaFailures), {
       preserveBoundaries: preserveTextBoundaries,
     });
     if (text && (isPrepared || !isSuppressedControlReplyText(text))) {
-      const previousBlock = content.at(-1);
-      if (Array.isArray(previousBlock)) {
-        previousBlock.push(text);
+      if (statusNotice) {
+        content.push({ type: "text", text, openclawStatusNotice: true });
       } else {
-        content.push([text]);
+        const previousBlock = content.at(-1);
+        if (Array.isArray(previousBlock)) {
+          previousBlock.push(text);
+        } else {
+          content.push([text]);
+        }
       }
     } else if (typeof payload.text === "string" && payload.text.trim().length > 0) {
       strippedTextPayloadCount += 1;
@@ -232,7 +229,11 @@ export async function buildAssistantReplyContentFromInputs(
     // stay attached to their source payload instead of matching display slots.
     const transcriptText = params.transcriptMediaMessage?.payloadTexts[entry.sourceIndex] ?? text;
     if (transcriptText && (isPrepared || !isSuppressedControlReplyText(transcriptText))) {
-      persistedContent.push({ type: "text", text: transcriptText });
+      persistedContent.push({
+        type: "text",
+        text: transcriptText,
+        ...(statusNotice ? { openclawStatusNotice: true } : {}),
+      });
     }
     if (params.includeSensitiveDisplay === true) {
       try {

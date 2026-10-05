@@ -16,13 +16,11 @@ import {
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   createSessionTranscriptFtsInserter,
-  deleteSessionTranscriptFtsRows,
-  deleteLegacySessionTranscriptFtsRows,
-  hasCompleteSessionTranscriptFtsRows,
+  deleteSessionTranscriptFtsRowsInTransaction,
 } from "./session-transcript-fts.js";
 import {
   prepareSessionTranscriptProjectionAppend,
-  type PreparedSessionTranscriptProjectionAppend,
+  type SessionTranscriptProjectionCursor,
   type TranscriptIndexEntry,
 } from "./session-transcript-projection-append.js";
 import {
@@ -30,21 +28,17 @@ import {
   visitSessionTranscriptProjection,
   type PreparedSessionTranscriptProjection,
 } from "./session-transcript-projection-rebuild.js";
+import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
 type TranscriptIndexDatabase = Pick<
   OpenClawAgentKyselyDatabase,
   | "session_windows"
   | "session_transcript_active_events"
-  | "session_transcript_fts"
   | "session_transcript_fts_rows"
   | "session_transcript_index_state"
   | "transcript_events"
 >;
 
-export type SessionTranscriptProjectionState = {
-  activeEventCount: number;
-  activeMessageCount: number;
-  indexedSeq: number;
-  leafEventId: string | null;
+export type SessionTranscriptProjectionState = SessionTranscriptProjectionCursor & {
   needsRebuild: boolean;
 };
 
@@ -92,7 +86,7 @@ export function shouldRebuildSessionTranscriptIndexSynchronously(
       .selectFrom(
         kysely
           .selectFrom("transcript_events")
-          .select((eb) => eb.fn<number>("octet_length", ["event_json"]).as("event_bytes"))
+          .select(transcriptEventReadBytesSql().as("event_bytes"))
           .where("session_id", "=", sessionId)
           .limit(SYNC_REBUILD_MAX_ROWS - events.length + 1)
           .as("stored"),
@@ -132,7 +126,6 @@ function readSessionTranscriptProjectionState(
         "indexed_seq",
         "leaf_event_id",
         "needs_rebuild",
-        "fts_row_count",
       ])
       .where("session_id", "=", sessionId),
   );
@@ -144,7 +137,7 @@ function readSessionTranscriptProjectionState(
     activeMessageCount: row.active_message_count,
     indexedSeq: row.indexed_seq,
     leafEventId: row.leaf_event_id,
-    needsRebuild: row.needs_rebuild !== 0 || row.fts_row_count === null,
+    needsRebuild: row.needs_rebuild !== 0,
   };
 }
 
@@ -177,8 +170,7 @@ function sessionTranscriptProjectionNeedsReconcile(
     !state ||
     state.needsRebuild ||
     state.indexedSeq !== latestSeq ||
-    hasUnclassifiedSessionTranscriptEvents(db, sessionId) ||
-    !hasCompleteSessionTranscriptFtsRows(db, sessionId)
+    hasUnclassifiedSessionTranscriptEvents(db, sessionId)
   );
 }
 
@@ -202,25 +194,7 @@ function createWatermarkWriter(db: DatabaseSync, sessionId: string, updateExisti
             .where("session_id", "=", sessionId)
         : kysely
             .insertInto("session_transcript_index_state")
-            .values({
-              session_id: sessionId,
-              ...values,
-              fts_row_count: kysely
-                .case()
-                .when(
-                  parameter((row) => (row.needsRebuild ? 1 : 0)),
-                  "=",
-                  1,
-                )
-                .then(null)
-                .else(
-                  kysely
-                    .selectFrom("session_transcript_fts_rows")
-                    .select((eb) => eb.fn.countAll<number>().as("count"))
-                    .where("session_id", "=", sessionId),
-                )
-                .end(),
-            })
+            .values({ session_id: sessionId, ...values })
             .onConflict((conflict) => conflict.column("session_id").doUpdateSet(values));
     },
   );
@@ -251,17 +225,6 @@ function deleteActiveEventRows(db: DatabaseSync, sessionId: string): void {
   );
 }
 
-function createFtsInserter(db: DatabaseSync, sessionId: string) {
-  const insert = createSessionTranscriptFtsInserter(db, sessionId);
-  return (entry: TranscriptIndexEntry) =>
-    insert({
-      text: entry.text,
-      message_id: entry.messageId,
-      role: entry.role,
-      timestamp: entry.timestamp,
-    });
-}
-
 /**
  * In-transaction batch appender. Forward-indexes the event when it
  * unambiguously extends the active branch and marks the session for rebuild
@@ -276,56 +239,41 @@ export function createTranscriptIndexAppenderInTransaction(
   let watermark = readSessionTranscriptProjectionState(db, sessionId);
   let hasUnclassifiedEvents: boolean | undefined;
   let insertActiveEvent: ReturnType<typeof createActiveEventInserter> | undefined;
-  let insertFts: ReturnType<typeof createFtsInserter> | undefined;
+  let insertFts: ReturnType<typeof createSessionTranscriptFtsInserter> | undefined;
   let updateWatermark: ReturnType<typeof createWatermarkWriter> | undefined;
   return (params) => {
-    if (!watermark) {
-      if (params.seq !== 0) {
-        // Pre-existing rows without index state (e.g. doctor-migrated
-        // transcripts): stay unindexed until reconcile rebuilds the session.
-        return true;
-      }
-      const append = prepareSessionTranscriptProjectionAppend({
-        ...params,
-        cursor: {
-          activeEventCount: 0,
-          activeMessageCount: 0,
-          indexedSeq: -1,
-          leafEventId: null,
-        },
-      });
-      if (!append) {
-        return true;
-      }
-      applyForwardIndex(params.createdAt, append);
-      return false;
-    }
-    if (watermark.needsRebuild) {
+    // Existing unindexed rows need a rebuild; only sequence zero initializes a projection.
+    if ((!watermark && params.seq !== 0) || watermark?.needsRebuild) {
       return true;
     }
-    if ((hasUnclassifiedEvents ??= hasUnclassifiedSessionTranscriptEvents(db, sessionId))) {
+    if (
+      watermark &&
+      (hasUnclassifiedEvents ??= hasUnclassifiedSessionTranscriptEvents(db, sessionId))
+    ) {
       // Out-of-band or older writers left incomplete projection facts. Once checked,
       // this batch's own forward rows all carry an explicit context classification.
       watermark = markSessionTranscriptIndexDirtyInTransaction(db, sessionId);
       return true;
     }
-    const append = prepareSessionTranscriptProjectionAppend({ ...params, cursor: watermark });
+    const append = prepareSessionTranscriptProjectionAppend({
+      ...params,
+      cursor: watermark ?? {
+        activeEventCount: 0,
+        activeMessageCount: 0,
+        indexedSeq: -1,
+        leafEventId: null,
+      },
+    });
     if (!append) {
       // Out-of-band writes, branch changes, and legacy/canonical transitions
       // need the full visible-tree resolver rather than append-time inference.
-      watermark = markSessionTranscriptIndexDirtyInTransaction(db, sessionId);
+      if (watermark) {
+        watermark = markSessionTranscriptIndexDirtyInTransaction(db, sessionId);
+      }
       return true;
     }
-    applyForwardIndex(params.createdAt, append);
-    return false;
-  };
-
-  function applyForwardIndex(
-    createdAt: number,
-    append: PreparedSessionTranscriptProjectionAppend,
-  ): void {
     if (append.ftsRow) {
-      insertFts ??= createFtsInserter(db, sessionId);
+      insertFts ??= createSessionTranscriptFtsInserter(db, sessionId);
       insertFts(append.ftsRow);
     }
     if (append.activeRow) {
@@ -335,7 +283,7 @@ export function createTranscriptIndexAppenderInTransaction(
     const nextWatermark = {
       ...append.cursor,
       needsRebuild: false,
-      updatedAt: createdAt,
+      updatedAt: params.createdAt,
     };
     // Initialization still upserts; this synchronous batch owns all subsequent updates.
     const write = watermark
@@ -343,7 +291,8 @@ export function createTranscriptIndexAppenderInTransaction(
       : createWatermarkWriter(db, sessionId);
     write(nextWatermark);
     watermark = nextWatermark;
-  }
+    return false;
+  };
 }
 
 /** Marks one session for lazy rebuild without touching its FTS rows. */
@@ -369,7 +318,7 @@ export function deleteSessionTranscriptIndexInTransaction(
   db: DatabaseSync,
   sessionId: string,
 ): void {
-  deleteSessionTranscriptFtsRows(db, sessionId);
+  deleteSessionTranscriptFtsRowsInTransaction(db, sessionId);
   deleteActiveEventRows(db, sessionId);
   executeSqliteQuerySync(
     db,
@@ -452,12 +401,8 @@ export function replaceSessionTranscriptIndexSuffixInTransaction(
             .flatMap((row) => (row.ftsEntry ? [row.ftsEntry.messageId] : [])),
         ),
       ];
-  if (!hasCompleteSessionTranscriptFtsRows(db, sessionId)) {
-    rebuildSessionTranscriptIndexInTransaction(db, sessionId);
-    return;
-  }
   if (removedMessageIds.length > 0) {
-    deleteSessionTranscriptFtsRows(db, sessionId, { messageIds: removedMessageIds });
+    deleteSessionTranscriptFtsRowsInTransaction(db, sessionId, { messageIds: removedMessageIds });
   }
   executeSqliteQuerySync(
     db,
@@ -468,7 +413,7 @@ export function replaceSessionTranscriptIndexSuffixInTransaction(
   );
 
   const insertActive = createActiveEventInserter(db, sessionId);
-  const insertFts = createFtsInserter(db, sessionId);
+  const insertFts = createSessionTranscriptFtsInserter(db, sessionId);
   const rowsToInsert = incremental
     ? params.next.activeRows
     : params.next.activeRows.slice(retainedCount);
@@ -497,11 +442,11 @@ export function replaceSessionTranscriptIndexSuffixInTransaction(
  * same append parent the accessor's next append will resolve.
  */
 function rebuildSessionTranscriptIndexInTransaction(db: DatabaseSync, sessionId: string): void {
-  deleteSessionTranscriptFtsRows(db, sessionId);
+  deleteSessionTranscriptFtsRowsInTransaction(db, sessionId);
   deleteActiveEventRows(db, sessionId);
   const projection = visitSessionTranscriptProjection(db, sessionId, {
     activeRow: createActiveEventInserter(db, sessionId),
-    ftsRow: createFtsInserter(db, sessionId),
+    ftsRow: createSessionTranscriptFtsInserter(db, sessionId),
   });
   if (!projection) {
     return;
@@ -565,15 +510,6 @@ function selectSessionsNeedingTranscriptIndexReconcile(db: DatabaseSync) {
         eb.or([
           eb(eb.fn.coalesce("st.needs_rebuild", eb.val(1)), "!=", 0),
           eb("latest.seq", ">", eb.fn.coalesce("st.indexed_seq", eb.val(-1))),
-          eb("st.fts_row_count", "is", null),
-          eb(
-            "st.fts_row_count",
-            "!=",
-            eb
-              .selectFrom("session_transcript_fts_rows as mapped")
-              .select((count) => count.fn.countAll<number>().as("count"))
-              .whereRef("mapped.session_id", "=", "session_windows.session_id"),
-          ),
           eb.and([
             // A clean store has no pending rows; check once before per-session probes.
             eb.exists(
@@ -621,78 +557,42 @@ export function listSessionsNeedingTranscriptIndexReconcile(db: DatabaseSync): s
 
 const transcriptIndexTables = [
   "session_transcript_active_events",
-  "session_transcript_fts",
   "session_transcript_fts_rows",
   "session_transcript_index_state",
 ] as const;
 
+function selectOrphanedTranscriptOwners(
+  db: DatabaseSync,
+  table: (typeof transcriptIndexTables)[number],
+) {
+  const kysely = getIndexKysely(db);
+  return (
+    kysely
+      .selectFrom(table)
+      .select("session_id")
+      .distinct()
+      .except(kysely.selectFrom("transcript_events").select("session_id").distinct())
+      // Older SQLite needs ordering to merge owner sets and skip duplicate keys.
+      .orderBy("session_id")
+  );
+}
+
 /** Orphan-only cleanup is independent of live sessions' projection watermarks. */
 export function hasOrphanedTranscriptIndexRows(db: DatabaseSync): boolean {
-  const kysely = getIndexKysely(db);
   return transcriptIndexTables.some(
     (table) =>
-      executeSqliteQueryTakeFirstSync(
-        db,
-        kysely
-          .selectFrom(table)
-          .select("session_id")
-          .where(
-            "session_id",
-            "not in",
-            kysely.selectFrom("transcript_events").select("session_id").distinct(),
-          )
-          .limit(1),
-      ) !== undefined,
+      executeSqliteQueryTakeFirstSync(db, selectOrphanedTranscriptOwners(db, table).limit(1)) !==
+      undefined,
   );
 }
 
 /** Drops index rows for sessions whose transcript rows are gone. */
 export function deleteOrphanedTranscriptIndexRowsInTransaction(db: DatabaseSync): void {
   const kysely = getIndexKysely(db);
-  const orphanIds = new Set<string>();
   for (const table of transcriptIndexTables) {
-    const rows = executeSqliteQuerySync(
-      db,
-      kysely
-        .selectFrom(table)
-        .select("session_id")
-        .distinct()
-        .where(
-          "session_id",
-          "not in",
-          kysely.selectFrom("transcript_events").select("session_id").distinct(),
-        ),
-    ).rows;
-    for (const row of rows) {
-      if (row.session_id !== null) {
-        orphanIds.add(row.session_id);
-      }
-    }
-  }
-  const legacyIds: string[] = [];
-  for (const sessionId of orphanIds) {
-    if (hasCompleteSessionTranscriptFtsRows(db, sessionId)) {
-      deleteSessionTranscriptFtsRows(db, sessionId, { mappingComplete: true });
-    } else {
-      legacyIds.push(sessionId);
-    }
-  }
-  if (legacyIds.length > 0) {
-    deleteLegacySessionTranscriptFtsRows(db, legacyIds);
-  }
-  for (const table of [
-    "session_transcript_active_events",
-    "session_transcript_index_state",
-  ] as const) {
     executeSqliteQuerySync(
       db,
-      kysely
-        .deleteFrom(table)
-        .where(
-          "session_id",
-          "not in",
-          kysely.selectFrom("transcript_events").select("session_id").distinct(),
-        ),
+      kysely.deleteFrom(table).where("session_id", "in", selectOrphanedTranscriptOwners(db, table)),
     );
   }
 }

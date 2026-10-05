@@ -7,6 +7,7 @@ import { requireDirectorySync, syncDirectorySync } from "../../infra/directory-d
 import { hasErrnoCode } from "../../infra/errno.js";
 import {
   executeSqliteQuerySync,
+  executeSqliteQueryTakeFirstSync,
   getNodeSqliteKysely,
   iterateSqliteQuerySync,
 } from "../../infra/kysely-sync.js";
@@ -18,6 +19,8 @@ import {
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
+import { readSessionGoalOperationInDatabase } from "./goals-operations.js";
+import type { SessionGoalOperation } from "./goals-operations.types.js";
 import { publishEncodedSessionTranscriptArchive } from "./session-accessor.sqlite-archive-artifact.js";
 import {
   readSessionStateDeleteSnapshot,
@@ -31,30 +34,36 @@ import {
   type SessionColdRecord,
 } from "./session-cold-storage-codec.js";
 import { readSessionColdStorageProtection } from "./session-cold-storage-eligibility.js";
+import { readSessionColdStorageInventory } from "./session-cold-storage-inventory.js";
+import {
+  readSessionAdmissionProtectionKeys,
+  selectSessionColdBatch,
+  type SessionColdBatchInput,
+} from "./session-cold-storage-selection.js";
 import {
   readSessionColdTranscript,
   type SessionColdArchive,
 } from "./session-cold-storage-state.js";
 import {
   createSessionTranscriptFtsInserter,
-  deleteSessionTranscriptFtsRows,
-  deleteLegacySessionTranscriptFtsRows,
-  hasCompleteSessionTranscriptFtsRows,
+  deleteSessionTranscriptFtsRowsInTransaction,
+  selectSessionTranscriptFtsRows,
 } from "./session-transcript-fts.js";
-
-// FTS5 has no type affinity: deployed writers persist timestamps as numbers or text.
-type ColdArchiveDatabase = Omit<DB, "session_transcript_fts"> & {
-  session_transcript_fts: Omit<DB["session_transcript_fts"], "timestamp"> & {
-    timestamp: string | number | null;
-  };
-};
+import {
+  createSessionTranscriptTurnKernel,
+  sqliteSessionTranscriptTurnRebound,
+} from "./session-turn.kernel.js";
+import type {
+  SqliteExpectedSessionTranscriptTurnResult,
+  SqliteSessionTurnOptions,
+} from "./session-turn.types.js";
+import { prepareTranscriptPayload, transcriptEventJsonSql } from "./transcript-payload.js";
 
 const MAX_COLD_ARCHIVE_BYTES = 64 * 1024 * 1024;
 
 type SessionColdPlan = {
   databaseOptions: OpenClawAgentDatabaseOptions & { path: string };
   sessionId: string;
-  beforeMs: number;
   snapshot: SessionStateDeleteSnapshot;
 };
 type SessionColdPrepared = {
@@ -66,18 +75,14 @@ type SessionColdExternalization = {
   archive: Omit<SessionColdArchive, "archive_blob">;
   envelopeBytes: number;
 };
-export type SessionColdBatchInput = {
-  databaseOptions: SessionColdPlan["databaseOptions"];
-  plans: SessionColdPlan[];
-  externalizations: Array<Omit<SessionColdArchive, "archive_blob">>;
-  maxBytes: number;
-};
 export type SessionColdPreparationWorkerData = {
   type: "sqlite-transcript-archive-v2";
   operation: "cold-prepare";
   input: SessionColdBatchInput;
 };
 export type SessionColdBatchPrepared = {
+  freePages: number;
+  protectionKeys: string[];
   prepared: SessionColdPrepared[];
   externalizations: SessionColdExternalization[];
   oversizedSessionIds: string[];
@@ -87,6 +92,24 @@ export type SessionColdMutationResult = {
   archivedTranscripts: number;
   externalizedTranscripts: number;
   restored: boolean;
+  sessionKey?: string;
+  turnRebound?: SqliteExpectedSessionTranscriptTurnResult;
+};
+export type SessionColdTurnGuard = {
+  agentId: string;
+  sessionKey: string;
+  options: Pick<
+    SqliteSessionTurnOptions,
+    | "keyFormat"
+    | "expectedSessionId"
+    | "selectedSessionId"
+    | "selectedLifecycleRevision"
+    | "expectedLifecycleRevision"
+    | "expectedWriterRunId"
+    | "expectedSessionState"
+    | "initialSessionEntry"
+  >;
+  goalOperation?: SessionGoalOperation;
 };
 export type SessionColdMutationPlan = { databaseOptions: SessionColdPlan["databaseOptions"] } & (
   | { kind: "cold-maintain" }
@@ -95,8 +118,14 @@ export type SessionColdMutationPlan = { databaseOptions: SessionColdPlan["databa
       prepared: SessionColdPrepared[];
       externalizations: SessionColdExternalization[];
       beforeMs: number;
+      protectionKeys: string[];
     }
-  | { kind: "cold-restore"; sessionId: string; archive: Omit<SessionColdArchive, "archive_blob"> }
+  | {
+      kind: "cold-restore";
+      sessionId: string;
+      archive: Omit<SessionColdArchive, "archive_blob">;
+      turnGuard?: SessionColdTurnGuard;
+    }
 );
 export type SessionColdWorkerData = {
   type: "sqlite-transcript-archive-v2";
@@ -150,7 +179,7 @@ async function prepareSessionColdArchiveInWorker(
               ) {
                 throw new Error("Transcript changed before cold archive preparation");
               }
-              const db = getNodeSqliteKysely<ColdArchiveDatabase>(database.db);
+              const db = getNodeSqliteKysely<DB>(database.db);
               write({
                 kind: "header",
                 version: 1,
@@ -161,7 +190,9 @@ async function prepareSessionColdArchiveInWorker(
                 database.db,
                 db
                   .selectFrom("transcript_events")
-                  .select(["seq", "event_json", "created_at"])
+                  .select("seq")
+                  .select(transcriptEventJsonSql(database.db).as("event_json"))
+                  .select("created_at")
                   .where("session_id", "=", plan.sessionId)
                   .orderBy("seq"),
               )) {
@@ -215,10 +246,7 @@ async function prepareSessionColdArchiveInWorker(
               }
               for (const row of iterateSqliteQuerySync(
                 database.db,
-                db
-                  .selectFrom("session_transcript_fts")
-                  .select(["text", "message_id", "role", "timestamp"])
-                  .where("session_id", "=", plan.sessionId),
+                selectSessionTranscriptFtsRows(database.db, plan.sessionId),
               )) {
                 write(sessionColdRecordSchema.parse({ kind: "fts", row }));
               }
@@ -285,7 +313,7 @@ async function prepareExternalization(
     (database) =>
       executeSqliteQuerySync(
         database.db,
-        getNodeSqliteKysely<ColdArchiveDatabase>(database.db)
+        getNodeSqliteKysely<DB>(database.db)
           .selectFrom("session_transcript_cold_archives")
           .selectAll()
           .where("session_id", "=", expected.session_id),
@@ -332,15 +360,25 @@ export async function prepareSessionColdBatchInWorker(
   input: SessionColdBatchInput,
 ): Promise<SessionColdBatchPrepared> {
   const result: SessionColdBatchPrepared = {
+    freePages: 0,
+    protectionKeys: [],
     prepared: [],
     externalizations: [],
     oversizedSessionIds: [],
     envelopeBytes: 0,
   };
+  const selection = selectSessionColdBatch(input);
+  if (!selection.found) {
+    return result;
+  }
+  result.freePages = selection.value.freePages;
   const maxBytes = Math.min(input.maxBytes, MAX_COLD_ARCHIVE_BYTES);
   const candidates = [
-    ...input.externalizations.map((archive) => ({ kind: "externalize" as const, archive })),
-    ...input.plans.map((plan) => ({ kind: "archive" as const, plan })),
+    ...selection.value.externalizations.map((archive) => ({
+      kind: "externalize" as const,
+      archive,
+    })),
+    ...selection.value.plans.map((plan) => ({ kind: "archive" as const, plan })),
   ];
   for (const candidate of candidates.slice(0, 128)) {
     const remaining = maxBytes - result.envelopeBytes;
@@ -373,6 +411,26 @@ export async function prepareSessionColdBatchInWorker(
       break;
     }
   }
+  const included = [
+    ...result.prepared.map((item) => item.plan.sessionId),
+    ...result.externalizations.map((item) => item.archive.session_id),
+  ];
+  if (included.length > 0) {
+    const protection = withOpenClawAgentDatabaseReadOnly(
+      (database) =>
+        runSqliteDeferredTransactionSync(
+          database.db,
+          () => [...readSessionAdmissionProtectionKeys(database, included)],
+          { databaseLabel: database.path, operationLabel: "cold admission protection" },
+        ),
+      input.databaseOptions,
+    );
+    if (!protection.found) {
+      throw new Error("Cold transcript database disappeared during preparation");
+    }
+    result.protectionKeys = protection.value;
+  }
+
   return result;
 }
 
@@ -412,7 +470,7 @@ export async function prepareSessionColdRestoreInWorker(
     (database) =>
       executeSqliteQuerySync(
         database.db,
-        getNodeSqliteKysely<ColdArchiveDatabase>(database.db)
+        getNodeSqliteKysely<DB>(database.db)
           .selectFrom("session_transcript_cold_archives")
           .selectAll()
           .where("session_id", "=", plan.sessionId),
@@ -453,7 +511,7 @@ export function mutateSessionColdTranscriptInWorker(
 ): SessionColdMutationResult {
   return runOpenClawAgentWriteTransaction(
     (database) => {
-      const db = getNodeSqliteKysely<ColdArchiveDatabase>(database.db);
+      const db = getNodeSqliteKysely<DB>(database.db);
       const result: SessionColdMutationResult = {
         archivedTranscripts: 0,
         externalizedTranscripts: 0,
@@ -464,8 +522,15 @@ export function mutateSessionColdTranscriptInWorker(
         return result;
       }
       if (plan.kind === "cold-batch") {
-        const legacyIds: string[] = [];
+        const protectionKeys = readSessionAdmissionProtectionKeys(database, [
+          ...plan.prepared.map((item) => item.plan.sessionId),
+          ...plan.externalizations.map((item) => item.archive.session_id),
+        ]);
+        if ([...protectionKeys].some((key) => !plan.protectionKeys.includes(key))) {
+          throw new Error("Transcript ownership changed; cold archival was canceled");
+        }
         const protectedIds = readSessionColdStorageProtection(database, plan.beforeMs);
+        const archivedIds: string[] = [];
         for (const prepared of plan.prepared) {
           const { sessionId, snapshot } = prepared.plan;
           const fresh = readSessionStateDeleteSnapshot(database.db, sessionId);
@@ -487,19 +552,15 @@ export function mutateSessionColdTranscriptInWorker(
             database.db,
             db.deleteFrom("transcript_events").where("session_id", "=", sessionId),
           );
-          if (hasCompleteSessionTranscriptFtsRows(database.db, sessionId)) {
-            deleteSessionTranscriptFtsRows(database.db, sessionId, { mappingComplete: true });
-          } else {
-            legacyIds.push(sessionId);
-          }
+          archivedIds.push(sessionId);
           executeSqliteQuerySync(
             database.db,
             db.deleteFrom("session_transcript_index_state").where("session_id", "=", sessionId),
           );
           result.archivedTranscripts++;
         }
-        if (legacyIds.length > 0) {
-          deleteLegacySessionTranscriptFtsRows(database.db, legacyIds);
+        if (archivedIds.length > 0) {
+          deleteSessionTranscriptFtsRowsInTransaction(database.db, archivedIds);
         }
         for (const { archive } of plan.externalizations) {
           const current = readSessionColdTranscript(database.db, archive.session_id);
@@ -523,6 +584,33 @@ export function mutateSessionColdTranscriptInWorker(
           result.externalizedTranscripts++;
         }
       } else {
+        if (plan.turnGuard) {
+          const { sessionKey, options, goalOperation } = plan.turnGuard;
+          const kernel = createSessionTranscriptTurnKernel(
+            {
+              agentId: plan.turnGuard.agentId,
+              path: database.path,
+              sessionId: plan.sessionId,
+              sessionKey,
+            },
+            { ...options, messages: [], sessionFile: "" },
+          );
+          const selected = kernel.readEntry(database);
+          if (
+            !kernel.resolveExpectedEntry(selected) &&
+            !(
+              selected?.entry.sessionId === options.expectedSessionId &&
+              goalOperation &&
+              readSessionGoalOperationInDatabase(database, {
+                sessionKey,
+                expectedSessionId: options.expectedSessionId,
+                operation: goalOperation,
+              })
+            )
+          ) {
+            return { ...result, turnRebound: sqliteSessionTranscriptTurnRebound(selected, "") };
+          }
+        }
         const current = readSessionColdTranscript(database.db, plan.sessionId);
         if (!current) {
           return result;
@@ -543,7 +631,12 @@ export function mutateSessionColdTranscriptInWorker(
             case "event":
               executeSqliteQuerySync(
                 database.db,
-                db.insertInto("transcript_events").values({ session_id, ...record.row }),
+                db.insertInto("transcript_events").values({
+                  session_id,
+                  seq: record.row.seq,
+                  created_at: record.row.created_at,
+                  ...prepareTranscriptPayload(database.db, record.row.event_json),
+                }),
               );
               break;
             case "identity":
@@ -565,11 +658,16 @@ export function mutateSessionColdTranscriptInWorker(
                 database.db,
                 db
                   .insertInto("session_transcript_index_state")
-                  .values({ session_id, ...record.row, fts_row_count: 0 }),
+                  .values({ session_id, ...record.row }),
               );
               break;
             case "fts":
-              insertFts(record.row);
+              insertFts({
+                messageId: record.row.message_id,
+                text: record.row.text,
+                role: record.row.role,
+                timestamp: record.row.timestamp,
+              });
               break;
           }
         }
@@ -578,6 +676,13 @@ export function mutateSessionColdTranscriptInWorker(
           db.deleteFrom("session_transcript_cold_archives").where("session_id", "=", session_id),
         );
         result.restored = true;
+        result.sessionKey = executeSqliteQueryTakeFirstSync(
+          database.db,
+          db
+            .selectFrom("session_windows")
+            .select("session_key")
+            .where("session_id", "=", session_id),
+        )?.session_key;
       }
       onCommit(database);
       return result;
@@ -585,4 +690,20 @@ export function mutateSessionColdTranscriptInWorker(
     plan.databaseOptions,
     { operationLabel: "session cold storage" },
   );
+}
+
+export function readSessionColdStorageInventoryInWorker(options: OpenClawAgentDatabaseOptions) {
+  const counts = withOpenClawAgentDatabaseReadOnly(readSessionColdStorageInventory, options);
+  return counts.found ? counts.value : readSessionColdStorageInventory();
+}
+
+export function readSessionColdMetadataInWorker(
+  options: OpenClawAgentDatabaseOptions,
+  sessionId: string,
+) {
+  const result = withOpenClawAgentDatabaseReadOnly(
+    (database) => readSessionColdTranscript(database.db, sessionId),
+    options,
+  );
+  return result.found ? result.value : undefined;
 }
